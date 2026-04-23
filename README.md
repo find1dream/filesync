@@ -37,14 +37,14 @@ Requires [podman](https://podman.io/). Builds inside an Alpine container using m
 
 ```bash
 make
-# → dist/filesync-linux-x86_64
+# → dist/filesync
 ```
 
 To use Docker instead, replace `podman` with `docker` in the Makefile.
 
 ### macOS arm64 (Apple Silicon)
 
-Requires Rust and the system libraries (`openssl`, `libssh2`). Install them with Homebrew if needed:
+Requires Rust and the system libraries. Install them with Homebrew if needed:
 
 ```bash
 brew install openssl libssh2
@@ -54,7 +54,7 @@ Then build natively:
 
 ```bash
 make native
-# → dist/filesync-native
+# → dist/filesync
 ```
 
 ### From source (any platform)
@@ -62,6 +62,16 @@ make native
 ```bash
 cargo build --release
 # → target/release/filesync
+```
+
+### Install
+
+Copy the binary to `/usr/local/bin` (requires write permission):
+
+```bash
+make install
+# or manually:
+sudo cp dist/filesync /usr/local/bin/filesync
 ```
 
 ## Requirements

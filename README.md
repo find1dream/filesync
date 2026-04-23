@@ -31,17 +31,38 @@ Select multiple items with `Space`, then press `c` to copy them all at once. If 
 
 ## Build
 
-Requires [podman](https://podman.io/) (or Docker — swap `podman` for `docker` in the Makefile).
+### Linux x86_64 (static binary, runs on any Linux)
+
+Requires [podman](https://podman.io/). Builds inside an Alpine container using musl — no system dependencies needed.
 
 ```bash
-# Static Linux x86_64 binary (runs on any Linux)
 make
-
-# Native binary for the current platform (run on macOS for arm64)
-make native
+# → dist/filesync-linux-x86_64
 ```
 
-Output goes to `dist/`.
+To use Docker instead, replace `podman` with `docker` in the Makefile.
+
+### macOS arm64 (Apple Silicon)
+
+Requires Rust and the system libraries (`openssl`, `libssh2`). Install them with Homebrew if needed:
+
+```bash
+brew install openssl libssh2
+```
+
+Then build natively:
+
+```bash
+make native
+# → dist/filesync-native
+```
+
+### From source (any platform)
+
+```bash
+cargo build --release
+# → target/release/filesync
+```
 
 ## Requirements
 

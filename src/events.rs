@@ -38,6 +38,8 @@ pub fn handle_events(app: &mut App) -> Result<bool> {
 }
 
 fn tick_transfer(app: &mut App) {
+    app.poll_remote_listing();
+
     if let Some(job) = &app.transfer_job {
         let p = job.progress.lock().unwrap();
         // Only clone when something changed to avoid 50ms-tick allocations.
@@ -80,12 +82,18 @@ fn handle_browse(app: &mut App, code: KeyCode, _mods: KeyModifiers) -> Result<bo
 
         KeyCode::Up | KeyCode::Char('k') => app.move_cursor_up(),
         KeyCode::Down | KeyCode::Char('j') => app.move_cursor_down(),
+        KeyCode::PageUp => app.move_page_up(),
+        KeyCode::PageDown => app.move_page_down(),
+        KeyCode::Home => app.move_to_top(),
+        KeyCode::End => app.move_to_bottom(),
 
         KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => app.enter_dir(),
         KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => app.go_parent(),
 
         KeyCode::Char(' ') => app.toggle_select(),
         KeyCode::Char('H') => app.toggle_hidden(),
+        KeyCode::Char('s') => app.cycle_sort(),
+        KeyCode::Char('o') => app.toggle_reverse(),
 
         KeyCode::Char('r') => match app.active_panel {
             Panel::Local => app.refresh_local(),

@@ -19,9 +19,9 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io;
 
 #[derive(Parser, Debug)]
-#[command(name = "filesync", about = "TUI SSH file manager")]
+#[command(name = "filesync", about = "TUI SSH file manager", after_help = "Example:\n  filesync muse@armo10220")]
 struct Args {
-    /// Remote host (e.g. user@hostname or user@192.168.0.1)
+    #[arg(value_name = "user@host")]
     host: String,
 }
 

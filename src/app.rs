@@ -1,10 +1,13 @@
 use crate::file_ops::{ProgressState, TransferJob};
 use crate::ssh::{RemoteEntry, SshClient};
-use crate::util::{selected_entries, sort_dir_first};
+use crate::util::{selected_entries, sort_dir_first, sort_name_mixed, sort_size_desc};
 use anyhow::Result;
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
+use std::time::UNIX_EPOCH;
+use std::sync::mpsc;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
@@ -21,6 +24,31 @@ pub enum AppMode {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SortMode {
+    NameDirFirst, // dirs first, then alpha (default)
+    NameMixed,    // pure alpha, dirs and files interleaved
+    SizeDesc,     // largest first
+}
+
+impl SortMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::NameDirFirst => Self::NameMixed,
+            Self::NameMixed => Self::SizeDesc,
+            Self::SizeDesc => Self::NameDirFirst,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NameDirFirst => "Name",
+            Self::NameMixed => "Mixed",
+            Self::SizeDesc => "Size↓",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ConfirmAction {
     Delete,
     Copy,
@@ -32,6 +60,7 @@ pub struct LocalEntry {
     pub path: PathBuf,
     pub is_dir: bool,
     pub size: u64,
+    pub modified: Option<u64>,
 }
 
 pub struct App {
@@ -51,6 +80,8 @@ pub struct App {
     pub remote_scroll: usize,
 
     pub show_hidden: bool,
+    pub sort_mode: SortMode,
+    pub sort_reversed: bool,
     pub active_panel: Panel,
     pub mode: AppMode,
 
@@ -62,6 +93,10 @@ pub struct App {
 
     /// Visible list rows — set by render before scroll clamping.
     pub visible_height: usize,
+
+    /// True while the remote listing is in flight.
+    pub remote_loading: bool,
+    pub remote_list_rx: Option<mpsc::Receiver<Result<Vec<RemoteEntry>>>>,
 }
 
 impl App {
@@ -70,12 +105,11 @@ impl App {
         let ssh = SshClient::connect(&user, &host, &password)?;
 
         let remote_cwd = ssh.home_dir().unwrap_or_else(|_| PathBuf::from("/"));
-        let remote_entries = ssh.list_dir(&remote_cwd).unwrap_or_default();
 
         let local_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         let local_entries = list_local(&local_cwd, false);
 
-        Ok(Self {
+        let mut app = Self {
             ssh,
             remote_host_label,
             local_cwd,
@@ -84,11 +118,13 @@ impl App {
             local_selected: HashSet::new(),
             local_scroll: 0,
             remote_cwd,
-            remote_entries,
+            remote_entries: vec![],
             remote_cursor: 0,
             remote_selected: HashSet::new(),
             remote_scroll: 0,
             show_hidden: false,
+            sort_mode: SortMode::NameDirFirst,
+            sort_reversed: false,
             active_panel: Panel::Local,
             mode: AppMode::Browse,
             transfer_job: None,
@@ -96,28 +132,67 @@ impl App {
             status_msg: String::new(),
             error_msg: String::new(),
             visible_height: 20,
-        })
+            remote_loading: false,
+            remote_list_rx: None,
+        };
+        app.start_remote_listing();
+        Ok(app)
     }
 
     pub fn refresh_local(&mut self) {
         self.local_entries = list_local(&self.local_cwd, self.show_hidden);
+        apply_sort_local(&mut self.local_entries, self.sort_mode, self.sort_reversed);
         self.local_cursor = self.local_cursor.min(self.local_entries.len().saturating_sub(1));
         self.local_selected.clear();
         self.clamp_scroll();
     }
 
     pub fn refresh_remote(&mut self) {
-        match self.ssh.list_dir(&self.remote_cwd) {
-            Ok(entries) => {
-                self.remote_entries = entries;
-                self.remote_cursor =
-                    self.remote_cursor.min(self.remote_entries.len().saturating_sub(1));
-                self.remote_selected.clear();
-                self.clamp_scroll();
+        self.start_remote_listing();
+    }
+
+    fn start_remote_listing(&mut self) {
+        let sftp = Arc::clone(&self.ssh.sftp);
+        let path = self.remote_cwd.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = SshClient::list_dir_sftp(&sftp, &path);
+            let _ = tx.send(result);
+        });
+        self.remote_loading = true;
+        self.remote_list_rx = Some(rx);
+    }
+
+    /// Poll the background listing thread. Call this every event-loop tick.
+    pub fn poll_remote_listing(&mut self) {
+        if self.remote_list_rx.is_none() {
+            return;
+        }
+        let result = self.remote_list_rx.as_ref().unwrap().try_recv();
+        match result {
+            Ok(listing) => {
+                self.remote_list_rx = None;
+                self.remote_loading = false;
+                match listing {
+                    Ok(mut entries) => {
+                        apply_sort_remote(&mut entries, self.sort_mode, self.sort_reversed);
+                        self.remote_entries = entries;
+                        self.remote_cursor = self
+                            .remote_cursor
+                            .min(self.remote_entries.len().saturating_sub(1));
+                        self.remote_selected.clear();
+                        self.clamp_scroll();
+                    }
+                    Err(e) => {
+                        self.error_msg = format!("Failed to list remote dir: {}", e);
+                        self.mode = AppMode::Error;
+                    }
+                }
             }
-            Err(e) => {
-                self.error_msg = format!("Failed to list remote dir: {}", e);
-                self.mode = AppMode::Error;
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.remote_list_rx = None;
+                self.remote_loading = false;
             }
         }
     }
@@ -172,7 +247,8 @@ impl App {
                         self.remote_cwd = entry.path.clone();
                         self.remote_cursor = 0;
                         self.remote_scroll = 0;
-                        self.refresh_remote();
+                        self.remote_entries.clear();
+                        self.start_remote_listing();
                     }
                 }
             }
@@ -194,10 +270,71 @@ impl App {
                     self.remote_cwd = parent.to_path_buf();
                     self.remote_cursor = 0;
                     self.remote_scroll = 0;
-                    self.refresh_remote();
+                    self.remote_entries.clear();
+                    self.start_remote_listing();
                 }
             }
         }
+    }
+
+    pub fn cycle_sort(&mut self) {
+        self.sort_mode = self.sort_mode.next();
+        apply_sort_local(&mut self.local_entries, self.sort_mode, self.sort_reversed);
+        apply_sort_remote(&mut self.remote_entries, self.sort_mode, self.sort_reversed);
+        self.local_cursor = 0;
+        self.remote_cursor = 0;
+        self.local_scroll = 0;
+        self.remote_scroll = 0;
+    }
+
+    pub fn toggle_reverse(&mut self) {
+        self.sort_reversed = !self.sort_reversed;
+        self.local_entries.reverse();
+        self.remote_entries.reverse();
+        self.local_cursor = 0;
+        self.remote_cursor = 0;
+        self.local_scroll = 0;
+        self.remote_scroll = 0;
+    }
+
+    pub fn move_page_up(&mut self) {
+        let page = self.visible_height.max(1);
+        match self.active_panel {
+            Panel::Local => self.local_cursor = self.local_cursor.saturating_sub(page),
+            Panel::Remote => self.remote_cursor = self.remote_cursor.saturating_sub(page),
+        }
+        self.clamp_scroll();
+    }
+
+    pub fn move_page_down(&mut self) {
+        let page = self.visible_height.max(1);
+        match self.active_panel {
+            Panel::Local => {
+                let max = self.local_entries.len().saturating_sub(1);
+                self.local_cursor = (self.local_cursor + page).min(max);
+            }
+            Panel::Remote => {
+                let max = self.remote_entries.len().saturating_sub(1);
+                self.remote_cursor = (self.remote_cursor + page).min(max);
+            }
+        }
+        self.clamp_scroll();
+    }
+
+    pub fn move_to_top(&mut self) {
+        match self.active_panel {
+            Panel::Local => self.local_cursor = 0,
+            Panel::Remote => self.remote_cursor = 0,
+        }
+        self.clamp_scroll();
+    }
+
+    pub fn move_to_bottom(&mut self) {
+        match self.active_panel {
+            Panel::Local => self.local_cursor = self.local_entries.len().saturating_sub(1),
+            Panel::Remote => self.remote_cursor = self.remote_entries.len().saturating_sub(1),
+        }
+        self.clamp_scroll();
     }
 
     pub fn toggle_select(&mut self) {
@@ -252,11 +389,41 @@ fn clamp_one(cursor: usize, scroll: &mut usize, height: usize) {
     }
 }
 
+fn apply_sort_local(entries: &mut Vec<LocalEntry>, mode: SortMode, reversed: bool) {
+    match mode {
+        SortMode::NameDirFirst => {
+            entries.sort_by(|a, b| sort_dir_first(a.is_dir, &a.name, b.is_dir, &b.name))
+        }
+        SortMode::NameMixed => entries.sort_by(|a, b| sort_name_mixed(&a.name, &b.name)),
+        SortMode::SizeDesc => {
+            entries.sort_by(|a, b| sort_size_desc(a.size, &a.name, b.size, &b.name))
+        }
+    }
+    if reversed {
+        entries.reverse();
+    }
+}
+
+fn apply_sort_remote(entries: &mut Vec<RemoteEntry>, mode: SortMode, reversed: bool) {
+    match mode {
+        SortMode::NameDirFirst => {
+            entries.sort_by(|a, b| sort_dir_first(a.is_dir, &a.name, b.is_dir, &b.name))
+        }
+        SortMode::NameMixed => entries.sort_by(|a, b| sort_name_mixed(&a.name, &b.name)),
+        SortMode::SizeDesc => {
+            entries.sort_by(|a, b| sort_size_desc(a.size, &a.name, b.size, &b.name))
+        }
+    }
+    if reversed {
+        entries.reverse();
+    }
+}
+
 pub fn list_local(dir: &PathBuf, show_hidden: bool) -> Vec<LocalEntry> {
     let Ok(rd) = fs::read_dir(dir) else {
         return vec![];
     };
-    let mut entries: Vec<LocalEntry> = rd
+    let entries: Vec<LocalEntry> = rd
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
@@ -264,15 +431,20 @@ pub fn list_local(dir: &PathBuf, show_hidden: bool) -> Vec<LocalEntry> {
                 return None;
             }
             let meta = e.metadata().ok()?;
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
             Some(LocalEntry {
                 name,
                 path: e.path(),
                 is_dir: meta.is_dir(),
                 size: if meta.is_file() { meta.len() } else { 0 },
+                modified,
             })
         })
         .collect();
 
-    entries.sort_by(|a, b| sort_dir_first(a.is_dir, &a.name, b.is_dir, &b.name));
     entries
 }

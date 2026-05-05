@@ -1,4 +1,3 @@
-use crate::util::sort_dir_first;
 use anyhow::{Context, Result, bail};
 use ssh2::{Session, Sftp};
 use std::net::TcpStream;
@@ -16,6 +15,7 @@ pub struct RemoteEntry {
     pub path: PathBuf,
     pub is_dir: bool,
     pub size: u64,
+    pub modified: Option<u64>,
 }
 
 impl SshClient {
@@ -41,9 +41,10 @@ impl SshClient {
         Ok(Self { session, sftp })
     }
 
-    pub fn list_dir(&self, path: &Path) -> Result<Vec<RemoteEntry>> {
-        let sftp = self.sftp.lock().unwrap();
-        let mut result: Vec<RemoteEntry> = sftp
+    /// List a directory using an already-cloned sftp Arc — safe to call from a background thread.
+    pub fn list_dir_sftp(sftp: &Arc<Mutex<Sftp>>, path: &Path) -> Result<Vec<RemoteEntry>> {
+        let sftp = sftp.lock().unwrap();
+        let result: Vec<RemoteEntry> = sftp
             .readdir(path)?
             .into_iter()
             .filter_map(|(pb, stat)| {
@@ -56,11 +57,11 @@ impl SshClient {
                     path: pb,
                     is_dir: stat.is_dir(),
                     size: stat.size.unwrap_or(0),
+                    modified: stat.mtime,
                 })
             })
             .collect();
 
-        result.sort_by(|a, b| sort_dir_first(a.is_dir, &a.name, b.is_dir, &b.name));
         Ok(result)
     }
 

@@ -3,16 +3,21 @@ use crate::app::{App, AppMode, ConfirmAction, Panel};
 const HELP_ITEMS: &[(&str, &str)] = &[
     ("[Tab]", "Switch"),
     ("[↑↓/jk]", "Navigate"),
+    ("[PgUp/Dn]", "Page"),
+    ("[Home/End]", "Top/Bot"),
     ("[Enter/→]", "Open"),
     ("[←/BS]", "Back"),
     ("[Space]", "Select"),
     ("[c]", "Copy"),
     ("[d]", "Delete"),
+    ("[s]", "Sort"),
+    ("[o]", "Reverse"),
     ("[H]", "Hidden"),
     ("[r]", "Refresh"),
     ("[q]", "Quit"),
 ];
 use bytesize::ByteSize;
+use chrono::{DateTime, Local, TimeZone};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -74,13 +79,22 @@ fn render_panel(f: &mut Frame, app: &App, area: Rect, panel: Panel) {
 
     let (title, scroll, cursor, selected) = match panel {
         Panel::Local => (
-            format!(" Local: {} ", app.local_cwd.display()),
+            format!(
+                " Local: {}  [{}{}] ",
+                app.local_cwd.display(),
+                app.sort_mode.label(),
+                if app.sort_reversed { " ↑" } else { " ↓" }
+            ),
             app.local_scroll,
             app.local_cursor,
             &app.local_selected,
         ),
         Panel::Remote => (
-            format!(" Remote [{}]: {} ", app.remote_host_label, app.remote_cwd.display()),
+            if app.remote_loading {
+                format!(" Remote [{}]: {}  [loading…] ", app.remote_host_label, app.remote_cwd.display())
+            } else {
+                format!(" Remote [{}]: {} ", app.remote_host_label, app.remote_cwd.display())
+            },
             app.remote_scroll,
             app.remote_cursor,
             &app.remote_selected,
@@ -101,7 +115,9 @@ fn render_panel(f: &mut Frame, app: &App, area: Rect, panel: Panel) {
             .enumerate()
             .skip(scroll)
             .take(inner.height as usize)
-            .map(|(i, e)| make_file_item(&e.name, e.is_dir, e.size, i, cursor, is_active, selected))
+            .map(|(i, e)| {
+                make_file_item(&e.name, e.is_dir, e.size, e.modified, i, cursor, is_active, selected, inner.width)
+            })
             .collect(),
         Panel::Remote => app
             .remote_entries
@@ -109,7 +125,9 @@ fn render_panel(f: &mut Frame, app: &App, area: Rect, panel: Panel) {
             .enumerate()
             .skip(scroll)
             .take(inner.height as usize)
-            .map(|(i, e)| make_file_item(&e.name, e.is_dir, e.size, i, cursor, is_active, selected))
+            .map(|(i, e)| {
+                make_file_item(&e.name, e.is_dir, e.size, e.modified, i, cursor, is_active, selected, inner.width)
+            })
             .collect(),
     };
 
@@ -120,10 +138,12 @@ fn make_file_item(
     name: &str,
     is_dir: bool,
     size: u64,
+    modified: Option<u64>,
     idx: usize,
     cursor: usize,
     panel_active: bool,
     selected: &HashSet<usize>,
+    panel_width: u16,
 ) -> ListItem<'static> {
     let is_cursor = idx == cursor && panel_active;
     let is_selected = selected.contains(&idx);
@@ -136,9 +156,19 @@ fn make_file_item(
     } else {
         format!("{:>12}", ByteSize(size).to_string())
     };
+    let date_str = match modified {
+        Some(ts) => Local
+            .timestamp_opt(ts as i64, 0)
+            .single()
+            .map(|dt: DateTime<Local>| dt.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "                ".to_string()),
+        None => "                ".to_string(),
+    };
 
-    let display_name = &name[..name.len().min(30)];
-    let text = format!("{}{}{:<30}  {}", sel_mark, prefix, display_name, size_str);
+    // Fixed columns: sel(1) + prefix(3) + sep(2) + date(16) + sep(2) + size(12) = 36
+    let name_width = (panel_width as usize).saturating_sub(36).max(8);
+    let display_name = &name[..name.len().min(name_width)];
+    let text = format!("{}{}{:<name_width$}  {}  {}", sel_mark, prefix, display_name, date_str, size_str, name_width = name_width);
 
     let mut style = Style::default().fg(if is_selected { Color::Yellow } else { base_fg });
     if is_cursor {

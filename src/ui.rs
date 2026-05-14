@@ -48,8 +48,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(chunks[0]);
 
-    // Update visible_height so cursor methods clamp correctly after this frame.
+    // Update visible_height and panel areas for mouse hit-testing.
     app.visible_height = panels[0].height.saturating_sub(2).max(1) as usize;
+    app.local_area = Some(panels[0]);
+    app.remote_area = Some(panels[1]);
     app.clamp_scroll();
 
     render_panel(f, app, panels[0], Panel::Local);

@@ -2,12 +2,13 @@ use crate::file_ops::{ProgressState, TransferJob};
 use crate::ssh::{RemoteEntry, SshClient};
 use crate::util::{selected_entries, sort_dir_first, sort_name_mixed, sort_size_desc};
 use anyhow::Result;
+use ratatui::layout::Rect;
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
-use std::time::UNIX_EPOCH;
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::{Instant, UNIX_EPOCH};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
@@ -97,12 +98,20 @@ pub struct App {
     /// True while the remote listing is in flight.
     pub remote_loading: bool,
     pub remote_list_rx: Option<mpsc::Receiver<Result<Vec<RemoteEntry>>>>,
+
+    /// Panel areas written by the renderer each frame; used for mouse hit-testing.
+    pub local_area: Option<Rect>,
+    pub remote_area: Option<Rect>,
+    /// Last mouse click: (panel, entry_index, time) for double-click detection.
+    pub last_click: Option<(Panel, usize, Instant)>,
+    /// Scroll acceleration state.
+    pub scroll_velocity: f32,
+    pub last_scroll_time: Option<Instant>,
 }
 
 impl App {
-    pub fn new(user: String, host: String, password: String) -> Result<Self> {
+    pub fn new(user: String, host: String, ssh: SshClient) -> Result<Self> {
         let remote_host_label = format!("{}@{}", user, host);
-        let ssh = SshClient::connect(&user, &host, &password)?;
 
         let remote_cwd = ssh.home_dir().unwrap_or_else(|_| PathBuf::from("/"));
 
@@ -134,6 +143,11 @@ impl App {
             visible_height: 20,
             remote_loading: false,
             remote_list_rx: None,
+            local_area: None,
+            remote_area: None,
+            last_click: None,
+            scroll_velocity: 1.0,
+            last_scroll_time: None,
         };
         app.start_remote_listing();
         Ok(app)

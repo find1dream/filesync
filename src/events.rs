@@ -1,10 +1,10 @@
 use crate::app::{App, AppMode, ConfirmAction, Panel};
 use crate::file_ops::{ProgressState, delete_local, delete_remote, start_download, start_upload};
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers, poll};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind, poll};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Returns true if the app should quit.
 pub fn handle_events(app: &mut App) -> Result<bool> {
@@ -13,24 +13,28 @@ pub fn handle_events(app: &mut App) -> Result<bool> {
         return Ok(false);
     }
 
-    if let Event::Key(key) = event::read()? {
-        let should_quit = match app.mode {
-            AppMode::Browse => handle_browse(app, key.code, key.modifiers)?,
-            AppMode::Confirm(action) => handle_confirm(app, action, key.code)?,
-            AppMode::Error => {
-                app.mode = AppMode::Browse;
-                app.error_msg.clear();
-                false
+    match event::read()? {
+        Event::Key(key) => {
+            let should_quit = match app.mode {
+                AppMode::Browse => handle_browse(app, key.code, key.modifiers)?,
+                AppMode::Confirm(action) => handle_confirm(app, action, key.code)?,
+                AppMode::Error => {
+                    app.mode = AppMode::Browse;
+                    app.error_msg.clear();
+                    false
+                }
+                AppMode::Status => {
+                    app.mode = AppMode::Browse;
+                    app.status_msg.clear();
+                    false
+                }
+            };
+            if should_quit {
+                return Ok(true);
             }
-            AppMode::Status => {
-                app.mode = AppMode::Browse;
-                app.status_msg.clear();
-                false
-            }
-        };
-        if should_quit {
-            return Ok(true);
         }
+        Event::Mouse(mouse) => handle_mouse(app, mouse.kind, mouse.column, mouse.row),
+        _ => {}
     }
 
     tick_transfer(app);
@@ -164,6 +168,126 @@ fn do_delete(app: &mut App) {
             app.status_msg = "Deleted successfully.".to_string();
             app.mode = AppMode::Status;
         }
+    }
+}
+
+fn handle_mouse(app: &mut App, kind: MouseEventKind, col: u16, row: u16) {
+    match kind {
+        MouseEventKind::ScrollUp => {
+            if let Some(panel) = panel_at(app, col, row) {
+                scroll_panel(app, panel, -1);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if let Some(panel) = panel_at(app, col, row) {
+                scroll_panel(app, panel, 1);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            handle_click(app, col, row);
+        }
+        _ => {}
+    }
+}
+
+fn panel_at(app: &App, col: u16, row: u16) -> Option<Panel> {
+    for panel in [Panel::Local, Panel::Remote] {
+        let area = match panel {
+            Panel::Local => app.local_area?,
+            Panel::Remote => app.remote_area?,
+        };
+        if col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height {
+            return Some(panel);
+        }
+    }
+    None
+}
+
+fn scroll_panel(app: &mut App, panel: Panel, delta: i32) {
+    // Accelerate when scroll events arrive quickly; reset when the user pauses.
+    let now = Instant::now();
+    let gap_ms = app
+        .last_scroll_time
+        .map(|t| now.duration_since(t).as_millis())
+        .unwrap_or(u128::MAX);
+
+    if gap_ms > 120 {
+        app.scroll_velocity = 1.0;
+    } else {
+        app.scroll_velocity = (app.scroll_velocity * 1.6).min(25.0);
+    }
+    app.last_scroll_time = Some(now);
+
+    let step = app.scroll_velocity as usize;
+
+    match panel {
+        Panel::Local => {
+            let len = app.local_entries.len();
+            if delta > 0 {
+                app.local_cursor = (app.local_cursor + step).min(len.saturating_sub(1));
+            } else if delta < 0 {
+                app.local_cursor = app.local_cursor.saturating_sub(step);
+            }
+        }
+        Panel::Remote => {
+            let len = app.remote_entries.len();
+            if delta > 0 {
+                app.remote_cursor = (app.remote_cursor + step).min(len.saturating_sub(1));
+            } else if delta < 0 {
+                app.remote_cursor = app.remote_cursor.saturating_sub(step);
+            }
+        }
+    }
+    app.clamp_scroll();
+}
+
+fn handle_click(app: &mut App, col: u16, row: u16) {
+    let Some(panel) = panel_at(app, col, row) else { return };
+    let area = match panel {
+        Panel::Local => app.local_area.unwrap(),
+        Panel::Remote => app.remote_area.unwrap(),
+    };
+
+    // Ignore clicks on the border row.
+    if row <= area.y || row >= area.y + area.height - 1 {
+        app.active_panel = panel;
+        return;
+    }
+
+    let row_in_content = (row - area.y - 1) as usize;
+    let scroll = match panel {
+        Panel::Local => app.local_scroll,
+        Panel::Remote => app.remote_scroll,
+    };
+    let entry_idx = scroll + row_in_content;
+
+    let entry_exists = match panel {
+        Panel::Local => entry_idx < app.local_entries.len(),
+        Panel::Remote => entry_idx < app.remote_entries.len(),
+    };
+
+    app.active_panel = panel;
+
+    if !entry_exists {
+        return;
+    }
+
+    let is_double = app
+        .last_click
+        .map(|(p, idx, t)| p == panel && idx == entry_idx && t.elapsed().as_millis() < 400)
+        .unwrap_or(false);
+
+    match panel {
+        Panel::Local => app.local_cursor = entry_idx,
+        Panel::Remote => app.remote_cursor = entry_idx,
+    }
+    app.clamp_scroll();
+
+    if is_double {
+        app.last_click = None;
+        app.enter_dir();
+    } else {
+        app.last_click = Some((panel, entry_idx, Instant::now()));
     }
 }
 
